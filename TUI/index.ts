@@ -1,215 +1,279 @@
 import {
   createCliRenderer,
-  Box,
-  Text,
-  Input,
-  ASCIIFont,
+  BoxRenderable,
+  TextRenderable,
+  InputRenderable,
+  ScrollBoxRenderable,
+  ASCIIFontRenderable,
+  RGBA,
   t,
   bold,
   fg,
   InputRenderableEvents,
+  Box,
 } from "@opentui/core"
+import { WsClient, type ConnectionState } from "./lib/ws-client"
+import { ChatStore } from "./lib/chat-store"
 
-// ── Colors (Claude Code-inspired palette) ──────────────────────────────
-const COLORS = {
-  accent: "#D97706",     // warm amber (Claude Code's signature color)
-  primary: "#E5E5E5",    // near-white text
-  secondary: "#A1A1AA",  // muted gray
-  dim: "#52525B",        // dimmer gray
-  surface: "#18181B",    // dark surface
-  inputBg: "#27272A",    // input background
-  inputFocusBg: "#3F3F46", // input focused background
-  border: "#3F3F46",     // border color
-  success: "#22C55E",    // green for status
+// ── Colors ─────────────────────────────────────────────────────────────
+const C = {
+  accent: "#D97706",
+  primary: "#E5E5E5",
+  secondary: "#A1A1AA",
+  dim: "#52525B",
+  surface: "#18181B",
+  inputBg: "#27272A",
+  inputFocusBg: "#3F3F46",
+  border: "#3F3F46",
+  success: "#22C55E",
+  error: "#EF4444",
 } as const
 
-// ── Model configuration ────────────────────────────────────────────────
-const MODEL_NAME = "MiMo-7B-RL"
-const MODEL_VERSION = "v0.1.0"
-const PROVIDER = "Xiaomi"
+// ── Renderer ───────────────────────────────────────────────────────────
+const renderer = await createCliRenderer({ exitOnCtrlC: false })
 
-// ── Create renderer ────────────────────────────────────────────────────
-const renderer = await createCliRenderer({
-  exitOnCtrlC: true,
-})
+// ── State ──────────────────────────────────────────────────────────────
+const chatStore = new ChatStore()
+let prevMsgCount = 0
 
-// ── Header: ASCII art logo ─────────────────────────────────────────────
-const logo = ASCIIFont({
-  text: "MIMO",
+// ── Header: logo ───────────────────────────────────────────────────────
+const logo = new ASCIIFontRenderable(renderer, {
+  id: "logo",
+  text: " MiMo TUI ",
   font: "tiny",
-  color: COLORS.accent,
+  color: RGBA.fromHex(C.accent),
 })
 
 // ── Header: model info ─────────────────────────────────────────────────
-const modelInfo = Box(
-  {
-    flexDirection: "column",
-    gap: 0,
-    paddingLeft: 1,
-    paddingTop: 1,
-  },
-  // Model name line
-  Text({
-    content: t`${bold(fg(COLORS.primary)(MODEL_NAME))}  ${fg(COLORS.dim)("·")}  ${fg(COLORS.secondary)(MODEL_VERSION)}`,
+const modelInfo = new BoxRenderable(renderer, {
+  id: "model-info",
+  flexDirection: "column",
+  padding: 1,
+})
+modelInfo.add(
+  new TextRenderable(renderer, {
+    id: "model-name",
+    content: t`${bold(fg(C.primary)("MiMo V2.5 pro"))}  ${fg(C.dim)("·")}  ${fg(C.secondary)("v0.1.0")}`,
   }),
-  // Provider line
-  Text({
-    content: t`${fg(COLORS.dim)(PROVIDER)}`,
+)
+modelInfo.add(
+  new TextRenderable(renderer, {
+    id: "model-provider",
+    content: t`${fg(C.dim)("Xiaomi")}`,
   }),
 )
 
-// ── Header separator ───────────────────────────────────────────────────
-const separator = Text({
-  content: "─".repeat(60),
-  fg: COLORS.dim,
-})
-
-// ── Middle: tips / shortcuts ───────────────────────────────────────────
-const shortcuts = Box(
-  {
+// ── Chat area: ScrollBox with sticky bottom ────────────────────────────
+const chatScroll = new ScrollBoxRenderable(renderer, {
+  id: "chat-scroll",
+  flexGrow: 1,
+  paddingLeft: 1,
+  paddingRight: 1,
+  paddingTop: 1,
+  stickyScroll: true,
+  stickyStart: "bottom",
+  contentOptions: {
     flexDirection: "column",
     gap: 1,
-    paddingLeft: 1,
-    paddingTop: 1,
   },
-  Text({
-    content: t`${bold(fg(COLORS.accent)("Tips for getting started:"))}`,
-  }),
-  Text({
-    content: t`  ${fg(COLORS.secondary)("1.")} ${fg(COLORS.primary)("Ask questions, edit files, or run commands.")}`,
-  }),
-  Text({
-    content: t`  ${fg(COLORS.secondary)("2.")} ${fg(COLORS.primary)("Be specific for best results.")}`,
-  }),
-  Text({
-    content: t`  ${fg(COLORS.secondary)("3.")} ${fg(COLORS.primary)("Type")} ${bold(fg(COLORS.accent)("/help"))}${fg(COLORS.primary)(" for available commands.")}`,
-  }),
-  Text({
-    content: t`  ${fg(COLORS.secondary)("4.")} ${fg(COLORS.primary)("Type")} ${bold(fg(COLORS.accent)("/quit"))}${fg(COLORS.primary)(" to exit.")}`,
-  }),
-)
+})
 
-// ── Bottom: input area ─────────────────────────────────────────────────
-const inputPrompt = Text({
-  content: t`${bold(fg(COLORS.accent)("❯"))}`,
+// ── Message rendering helpers ──────────────────────────────────────────
+const ROLE_PREFIX: Record<string, string> = {
+  user: "❯ ",
+  assistant: "● ",
+  error: "✗ ",
+}
+const ROLE_COLOR: Record<string, string> = {
+  user: C.accent,
+  assistant: C.success,
+  error: C.error,
+}
+
+function makeMsgText(index: number, role: string, content: string): TextRenderable {
+  const prefix = ROLE_PREFIX[role] ?? ROLE_PREFIX["assistant"]!
+  const color = ROLE_COLOR[role] ?? C.primary
+  const msgColor = role === "error" ? C.error : C.primary
+  return new TextRenderable(renderer, {
+    id: `msg-${index}`,
+    content: t`${bold(fg(color)(prefix))}${fg(msgColor)(content)}`,
+    selectable: true,
+  })
+}
+
+function renderMessages() {
+  const messages = chatStore.getDisplayMessages()
+
+  // ── Clear ──
+  if (messages.length === 0) {
+    for (const child of chatScroll.getChildren()) {
+      child.destroy()
+    }
+    prevMsgCount = 0
+    return
+  }
+
+  // ── Streaming: update last element in-place ──
+  if (chatStore.isStreaming() && messages.length <= prevMsgCount) {
+    const last = messages[messages.length - 1]!
+    const lastId = `msg-${prevMsgCount - 1}`
+    chatScroll.remove(lastId)
+    chatScroll.add(makeMsgText(prevMsgCount - 1, last.role, last.content))
+    return
+  }
+
+  // ── New messages: append ──
+  while (prevMsgCount < messages.length) {
+    const msg = messages[prevMsgCount]!
+    chatScroll.add(makeMsgText(prevMsgCount, msg.role, msg.content))
+    prevMsgCount++
+  }
+}
+
+chatStore.onChange(() => renderMessages())
+
+// ── Status bar ─────────────────────────────────────────────────────────
+const statusLeft = new TextRenderable(renderer, {
+  id: "status-left",
+  content: "",
+  selectable: false,
+})
+const statusRight = new TextRenderable(renderer, {
+  id: "status-right",
+  content: t`${fg(C.dim)("/quit")} to quit  ${fg(C.dim)("·")}  ${fg(C.dim)("/help")} for commands`,
   selectable: false,
 })
 
-const input = Input({
-  id: "main-input",
-  placeholder: "Ask MiMo anything...",
-  backgroundColor: COLORS.inputBg,
-  focusedBackgroundColor: COLORS.inputFocusBg,
-  textColor: COLORS.primary,
-  cursorColor: COLORS.accent,
+function updateStatus(state: ConnectionState) {
+  const map: Record<ConnectionState, { dot: string; label: string }> = {
+    connecting: { dot: C.accent, label: "connecting..." },
+    connected: { dot: C.success, label: "connected" },
+    disconnected: { dot: C.dim, label: "disconnected" },
+    error: { dot: C.error, label: "connection error" },
+  }
+  const { dot, label } = map[state]
+  statusLeft.content = t`${fg(dot)("●")} ${fg(C.dim)(label)}`
+}
+
+const statusBar = new BoxRenderable(renderer, {
+  id: "status-bar",
+  flexDirection: "row",
+  justifyContent: "space-between",
+  width: "100%",
+  paddingLeft: 1,
+  paddingRight: 1,
+})
+statusBar.add(statusLeft)
+statusBar.add(statusRight)
+
+// ── Input area ─────────────────────────────────────────────────────────
+const inputPrompt = new TextRenderable(renderer, {
+  id: "input-prompt",
+  content: t`${bold(fg(C.accent)("❯ "))}`,
+  selectable: false,
 })
 
-// Focus the input on start
+const input = new InputRenderable(renderer, {
+  id: "main-input",
+  placeholder: "Ask MiMo anything...",
+  backgroundColor: C.inputBg,
+  focusedBackgroundColor: C.inputFocusBg,
+  textColor: C.primary,
+  cursorColor: C.accent,
+  flexGrow: 1,
+})
+
 input.focus()
 
-const inputArea = Box(
-  {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 1,
-    paddingLeft: 1,
-    paddingRight: 1,
-    width: "100%",
-  },
-  inputPrompt,
-  Box(
-    {
-      flexGrow: 1,
-    },
-    input,
-  ),
-)
-
-// ── Bottom bar: status ─────────────────────────────────────────────────
-const statusBar = Box(
-  {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    width: "100%",
-    paddingLeft: 1,
-    paddingRight: 1,
-  },
-  Text({
-    content: t`${fg(COLORS.dim)("Ctrl+C")} to quit  ${fg(COLORS.dim)("·")}  ${fg(COLORS.dim)("/help")} for commands`,
-    selectable: false,
-  }),
-  Text({
-    content: t`${fg(COLORS.success)("●")} ${fg(COLORS.dim)("ready")}`,
-    selectable: false,
-  }),
-)
+const inputRow = new BoxRenderable(renderer, {
+  id: "input-row",
+  flexDirection: "row",
+  alignItems: "center",
+  width: "100%",
+  paddingLeft: 1,
+  paddingRight: 1,
+  height: 1,
+})
+inputRow.add(inputPrompt)
+inputRow.add(input)
 
 // ── Root layout ────────────────────────────────────────────────────────
-renderer.root.add(
-  Box(
-    {
-      width: "100%",
-      height: "100%",
-      flexDirection: "column",
-      backgroundColor: COLORS.surface,
-    },
-    // ── Top section: logo + model info ──
-    Box(
-      {
-        flexDirection: "column",
-        padding: 1,
-        paddingBottom: 0,
-      },
-      logo,
-      modelInfo,
-    ),
-    // ── Separator ──
-    Box(
-      {
-        paddingLeft: 1,
-        paddingRight: 1,
-        paddingTop: 1,
-        paddingBottom: 1,
-      },
-      separator,
-    ),
-    // ── Middle: tips area (takes remaining space) ──
-    Box(
-      {
-        flexGrow: 1,
-        flexDirection: "column",
-      },
-      shortcuts,
-    ),
-    // ── Input separator ──
-    Box(
-      {
-        paddingLeft: 1,
-        paddingRight: 1,
-      },
-      Text({
-        content: "─".repeat(60),
-        fg: COLORS.border,
-      }),
-    ),
-    // ── Bottom: input bar ──
-    Box(
-      {
-        flexDirection: "column",
-        paddingTop: 0,
-        paddingBottom: 1,
-      },
-      inputArea,
-    ),
-    // ── Status bar ──
-    statusBar,
-  ),
-)
+const root = new BoxRenderable(renderer, {
+  id: "root",
+  width: "100%",
+  height: "100%",
+  flexDirection: "column",
+  backgroundColor: C.surface,
+})
 
-// ── Handle input events ────────────────────────────────────────────────
+const header = new BoxRenderable(renderer, {
+  id: "header",
+  flexDirection: "column",
+  padding: 1,
+  paddingBottom: 0,
+})
+header.add(logo)
+header.add(modelInfo)
+
+root.add(Box({borderStyle: "single", borderColor: C.accent},logo, modelInfo))
+root.add(chatScroll)
+root.add(Box({borderStyle: "single",height: 3, width: "105%", marginX:-1, borderColor: C.border},inputRow))
+root.add(statusBar)
+
+renderer.root.add(root)
+
+// ── WebSocket client ───────────────────────────────────────────────────
+const ws = new WsClient({
+  url: "ws://localhost:8765/ws",
+  onToken(token) {
+    chatStore.appendToken(token)
+  },
+  onDone() {
+    chatStore.finishStreaming()
+    input.focus()
+  },
+  onError(message) {
+    chatStore.handleError(message)
+    input.focus()
+  },
+  onStateChange(state) {
+    updateStatus(state)
+  },
+})
+
+updateStatus("connecting")
+ws.connect()
+
+// ── Handle user input ──────────────────────────────────────────────────
 input.on(InputRenderableEvents.ENTER, (value: string) => {
-  if (value.trim()) {
-    // For now, just clear the input after submission
-    input.value = ""
+  const content = value.trim()
+  if (!content) return
+  if (chatStore.isStreaming()) return
+
+  if (content === "/quit") {
+    ws.disconnect()
+    renderer.destroy()
+    process.exit(0)
   }
+
+  if (content === "/clear") {
+    chatStore.clear()
+    ws.clearHistory()
+    input.value = ""
+    return
+  }
+
+  if (content === "/help") {
+    chatStore.addMessage(
+      "assistant",
+      "Available commands:\n  /clear  - Clear chat history\n  /quit   - Exit\n  /help   - Show this help",
+    )
+    input.value = ""
+    return
+  }
+
+  chatStore.addMessage("user", content)
+  chatStore.startStreaming()
+  ws.sendMessage(content)
+  input.value = ""
 })
