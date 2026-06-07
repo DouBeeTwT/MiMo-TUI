@@ -2,6 +2,8 @@ import {
   createCliRenderer,
   BoxRenderable,
   TextRenderable,
+  MarkdownRenderable,
+  SyntaxStyle,
   InputRenderable,
   ScrollBoxRenderable,
   ASCIIFontRenderable,
@@ -10,8 +12,8 @@ import {
   bold,
   fg,
   InputRenderableEvents,
-  Box,
 } from "@opentui/core"
+import { preprocessMarkdown } from "./lib/latex-renderer"
 import { WsClient, type ConnectionState } from "./lib/ws-client"
 import { ChatStore } from "./lib/chat-store"
 
@@ -90,14 +92,49 @@ const ROLE_COLOR: Record<string, string> = {
   error: C.error,
 }
 
-function makeMsgText(index: number, role: string, content: string): TextRenderable {
+// ── Markdown style ─────────────────────────────────────────────────────
+const mdStyle = SyntaxStyle.fromStyles({
+  default: { fg: RGBA.fromHex(C.primary) },
+  "markup.heading.1": { fg: RGBA.fromHex("#D97706"), bold: true },
+  "markup.heading.2": { fg: RGBA.fromHex("#D97706"), bold: true },
+  "markup.heading.3": { fg: RGBA.fromHex("#E5A84B"), bold: true },
+  "markup.heading.4": { fg: RGBA.fromHex("#E5A84B") },
+  "markup.heading.5": { fg: RGBA.fromHex("#C49A3D") },
+  "markup.heading.6": { fg: RGBA.fromHex("#C49A3D") },
+  "markup.bold": { bold: true },
+  "markup.italic": { italic: true },
+  "markup.raw": { fg: RGBA.fromHex("#7DD3FC") },
+  "markup.code": { fg: RGBA.fromHex("#7DD3FC") },
+  "markup.list": { fg: RGBA.fromHex(C.accent) },
+  "markup.list.checked": { fg: RGBA.fromHex("#22C55E") },
+  "markup.list.unchecked": { fg: RGBA.fromHex(C.dim) },
+  "markup.quote": { fg: RGBA.fromHex(C.secondary) },
+  "markup.link": { fg: RGBA.fromHex("#60A5FA") },
+})
+
+function makeMsgText(index: number, role: string, content: string, streaming = false): TextRenderable | MarkdownRenderable {
   const prefix = ROLE_PREFIX[role] ?? ROLE_PREFIX["assistant"]!
   const color = ROLE_COLOR[role] ?? C.primary
-  const msgColor = role === "error" ? C.error : C.primary
-  return new TextRenderable(renderer, {
+
+  // User messages: plain text
+  if (role === "user") {
+    return new TextRenderable(renderer, {
+      id: `msg-${index}`,
+      content: t`${bold(fg(color)(prefix))}${fg(C.primary)(content)}`,
+      selectable: true,
+    })
+  }
+
+  // Assistant / error: preprocess LaTeX, then MarkdownRenderable
+  const processed = preprocessMarkdown(content)
+  return new MarkdownRenderable(renderer, {
     id: `msg-${index}`,
-    content: t`${bold(fg(color)(prefix))}${fg(msgColor)(content)}`,
-    selectable: true,
+    width: "100%",
+    content: processed,
+    syntaxStyle: mdStyle,
+    fg: role === "error" ? C.error : C.primary,
+    conceal: true,
+    streaming,
   })
 }
 
@@ -118,7 +155,7 @@ function renderMessages() {
     const last = messages[messages.length - 1]!
     const lastId = `msg-${prevMsgCount - 1}`
     chatScroll.remove(lastId)
-    chatScroll.add(makeMsgText(prevMsgCount - 1, last.role, last.content))
+    chatScroll.add(makeMsgText(prevMsgCount - 1, last.role, last.content, true))
     return
   }
 
@@ -209,15 +246,28 @@ const root = new BoxRenderable(renderer, {
 const header = new BoxRenderable(renderer, {
   id: "header",
   flexDirection: "column",
+  borderStyle: "single",
+  borderColor: C.accent,
   padding: 1,
   paddingBottom: 0,
 })
 header.add(logo)
 header.add(modelInfo)
 
-root.add(Box({borderStyle: "single", borderColor: C.accent},logo, modelInfo))
+const inputWrapper = new BoxRenderable(renderer, {
+  id: "input-wrapper",
+  borderStyle: "single",
+  borderColor: C.border,
+  height: 3,
+  width: "100%",
+  paddingLeft: 1,
+  paddingRight: 1,
+})
+inputWrapper.add(inputRow)
+
+root.add(header)
 root.add(chatScroll)
-root.add(Box({borderStyle: "single",height: 3, width: "105%", marginX:-1, borderColor: C.border},inputRow))
+root.add(inputWrapper)
 root.add(statusBar)
 
 renderer.root.add(root)
